@@ -1,0 +1,25 @@
+# ── Core UI ────────────────────────────────────────────────────────────────
+streamlit>=1.32.0
+
+# ── PDF ingestion ───────────────────────────────────────────────────────────
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0           # fitz — fallback extractor + OCR page rendering
+pytesseract>=0.3.10       # Tesseract OCR Python wrapper
+Pillow>=10.0.0            # image preprocessing for OCR
+
+# ── NLP ─────────────────────────────────────────────────────────────────────
+spacy>=3.7.0
+# After install, run: python -m spacy download en_core_web_sm
+
+# ── Graph ───────────────────────────────────────────────────────────────────
+networkx>=3.2.0
+pyvis>=0.3.2              # interactive graph HTML rendering
+
+# ── Visualisation ───────────────────────────────────────────────────────────
+matplotlib>=3.8.0
+
+# ── Export ──────────────────────────────────────────────────────────────────
+fpdf2>=2.7.0              # PDF report generation
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+numpy>=1.24.0
