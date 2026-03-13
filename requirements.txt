@@ -17,11 +17,8 @@ pyvis>=0.3.2              # interactive graph HTML rendering
 
 # ── Visualisation ───────────────────────────────────────────────────────────
 matplotlib>=3.8.0
-
 # ── Export ──────────────────────────────────────────────────────────────────
 fpdf2>=2.7.0              # PDF report generation
 
 # ── Utilities ───────────────────────────────────────────────────────────────
 numpy>=1.24.0
-
-en-core-web-sm==3.7.1
