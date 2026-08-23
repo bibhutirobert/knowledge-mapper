@@ -133,7 +133,7 @@ Edit values at the top of each module file:
 | `pdf_ingestion.py` | `CHUNK_SIZE` | 20 | Pages per processing window |
 | `pdf_ingestion.py` | `CHUNK_OVERLAP` | 3 | Overlap between windows |
 | `compression_engine.py` | `THRESHOLD_CORE` | 0.75 | Min score to be a core concept |
-| `compression_engine.py` | `MAX_NODES` | 80 | Max nodes in compressed output |
+| `compression_engine.py` | `MAX_NODES` | 80 | Max nodes in compressed output (overridden by the sidebar's compression level) |
 | `compression_engine.py` | `MAX_CLUSTER_SIZE` | 12 | Max concepts per cluster |
 
 ---
@@ -147,6 +147,8 @@ Edit values at the top of each module file:
 **`pyvis not rendering`** — the interactive graph requires a browser with JavaScript. If running in a restricted environment the app automatically falls back to the static NetworkX graph.
 
 **Very few concepts extracted** — this usually means the PDF is purely image-based. The app will automatically retry with Tesseract OCR. For best results, use a PDF with embedded text.
+
+**Processing time** — roughly linear in page count: about 15s for a 60-page PDF and 75s for a 300-page one, plus OCR time if the PDF is scanned. Raise the **Compression level** slider to keep fewer nodes in the final map.
 
 ---
 

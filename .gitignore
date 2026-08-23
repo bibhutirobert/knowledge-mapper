@@ -1,0 +1,20 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime output
+logs/
+output/
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Packaging
+*.egg-info/
+knowledge_mapper.zip
