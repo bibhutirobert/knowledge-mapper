@@ -74,7 +74,7 @@ def _make_extraction() -> "ExtractionResult":
         ("Interface",      ConceptType.DEFINITION),
         ("Pattern",        ConceptType.INSIGHT),
     ]):
-        cid = ConceptNode.make_id(title, i + 1)
+        cid = ConceptNode.make_id(title)
         concepts.append(ConceptNode(
             id=cid, title=title, concept_type=ctype,
             definition=f"{title} is a key concept in software design.",
@@ -242,11 +242,34 @@ class TestConceptExtraction(unittest.TestCase):
 
     def test_concept_node_make_id_stable(self):
         from modules.concept_extraction import ConceptNode
-        id1 = ConceptNode.make_id("Abstraction", 5)
-        id2 = ConceptNode.make_id("Abstraction", 5)
+        id1 = ConceptNode.make_id("Abstraction")
+        id2 = ConceptNode.make_id("Abstraction")
         self.assertEqual(id1, id2)
-        id3 = ConceptNode.make_id("Abstraction", 6)
-        self.assertNotEqual(id1, id3)
+        self.assertNotEqual(id1, ConceptNode.make_id("Composition"))
+
+    def test_concept_id_is_page_independent(self):
+        """
+        The same concept discussed on different pages must share an id,
+        otherwise deduplication and recurrence tracking silently do nothing.
+        """
+        from modules.concept_extraction import ConceptNode
+        self.assertEqual(ConceptNode.make_id("Abstraction"),
+                         ConceptNode.make_id("  abstraction. "))
+
+    def test_deduplication_accumulates_recurrence_pages(self):
+        from modules.concept_extraction import (
+            ConceptNode, ConceptType, _deduplicate_concepts,
+        )
+        mentions = [
+            ConceptNode(id=ConceptNode.make_id("Entropy"), title="Entropy",
+                        concept_type=ConceptType.DEFINITION, definition="short",
+                        context={}, source_page=page, recurrence=[page])
+            for page in (3, 17, 42)
+        ]
+        merged = _deduplicate_concepts(mentions)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].recurrence, [3, 17, 42])
+        self.assertEqual(merged[0].source_page, 3)
 
     def test_definition_not_empty(self):
         ext = _make_extraction()
@@ -475,6 +498,133 @@ class TestExports(unittest.TestCase):
 # Tests: Error handler / self-healing
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestRegressions(unittest.TestCase):
+    """Guards for the bugs that made the app hang or fail after an upload."""
+
+    def test_relation_detection_scales_to_book_sized_input(self):
+        """
+        The original detector compared every ordered pair of concept titles
+        against every signal phrase, per segment. At ~1,400 concepts that is
+        billions of regex searches and the app never returns. This must finish
+        in seconds, not minutes.
+        """
+        import time
+        from modules.concept_extraction import (
+            ConceptNode, ConceptType, _detect_relations,
+        )
+        from modules.text_segmentation import Segment
+
+        titles = [f"concept number {i}" for i in range(1200)]
+        concepts = [
+            ConceptNode(id=ConceptNode.make_id(t), title=t,
+                        concept_type=ConceptType.DEFINITION, definition="a definition here",
+                        context={}, source_page=1, recurrence=[1])
+            for t in titles
+        ]
+        segments = [
+            Segment(segment_id=f"s{i}", segment_type="paragraph", title="",
+                    text=" ".join(
+                        f"{titles[(i * 7 + j) % len(titles)]} depends on "
+                        f"{titles[(i * 7 + j + 1) % len(titles)]}."
+                        for j in range(12)
+                    ),
+                    start_page=i + 1, end_page=i + 1, depth=2)
+            for i in range(60)
+        ]
+
+        started = time.time()
+        edges = _detect_relations(concepts, segments)
+        elapsed = time.time() - started
+
+        self.assertLess(elapsed, 20.0, f"relation detection took {elapsed:.1f}s")
+        self.assertTrue(edges, "expected DEPENDS_ON edges to be detected")
+
+    def test_relation_edge_ids_are_unique(self):
+        from modules.concept_extraction import (
+            ConceptNode, ConceptType, _detect_relations,
+        )
+        from modules.text_segmentation import Segment
+
+        concepts = [
+            ConceptNode(id=ConceptNode.make_id(t), title=t,
+                        concept_type=ConceptType.DEFINITION, definition="a definition here",
+                        context={}, source_page=1, recurrence=[1])
+            for t in ("entropy", "a closed system")
+        ]
+        text = "entropy depends on a closed system. " * 20
+        segments = [
+            Segment(segment_id=f"s{i}", segment_type="paragraph", title="", text=text,
+                    start_page=i + 1, end_page=i + 1, depth=2)
+            for i in range(5)
+        ]
+        edges = _detect_relations(concepts, segments)
+        ids = [e.id for e in edges]
+        self.assertEqual(len(ids), len(set(ids)), "duplicate edges inflate relation counts")
+
+    def test_pdf_export_handles_non_latin1_text(self):
+        """Book text carries smart quotes, dashes and ligatures; fpdf2's core
+        fonts are latin-1 only and used to abort the whole export."""
+        from export.pdf_exporter import export_to_pdf
+        from modules.compression_engine import (
+            CompressionResult, MindMapNode, MindMapBridge,
+        )
+        root = MindMapNode(
+            id="r", label="G\u00f6del\u2019s theorem \u2014 \u201ccompleteness\u201d",
+            concept_type="THEOREM", score=0.9, tier="CORE",
+            definition="\u2200x, a \ufb01ligree definition with \u65e5\u672c\u8a9e text.",
+            source_page=3,
+        )
+        root.children.append(MindMapNode(
+            id="c", label="\u00c9mile\u2019s corollary \u21d2 \u221e",
+            concept_type="DEFINITION", score=0.5, tier="SUPPORTING",
+            definition="na\u00efve caf\u00e9 r\u00e9sum\u00e9", source_page=4,
+        ))
+        result = CompressionResult(
+            mind_map_root=root,
+            bridges=[MindMapBridge("r", "c", "SUPPORTS", "supports")],
+            compression_report={"compressed_node_count": 2, "ratio": 0.5, "cluster_count": 1},
+        )
+        data = export_to_pdf(result, title="Knowledge Map \u2014 \u00dcn\u00efc\u00f6d\u00e9")
+        self.assertIsInstance(data, bytes)
+        self.assertTrue(data.startswith(b"%PDF"))
+
+    def test_clustering_survives_ids_missing_from_concepts(self):
+        """A survivor id with no backing concept used to raise AttributeError."""
+        from modules.compression_engine import _cluster_concepts
+        from modules.knowledge_graph import build_knowledge_graph
+        graph = build_knowledge_graph(_make_extraction())
+        clusters, _bridges = _cluster_concepts(graph, ["ghost-id-not-in-concepts"])
+        self.assertTrue(clusters)
+
+    def test_compression_level_shrinks_the_map(self):
+        from modules.compression_engine import compress_graph, max_nodes_for_level
+        from modules.knowledge_graph import build_knowledge_graph
+        graph = build_knowledge_graph(_make_extraction())
+        loose = compress_graph(graph, max_nodes=max_nodes_for_level(1))
+        tight = compress_graph(graph, max_nodes=max_nodes_for_level(5))
+        self.assertIsNotNone(loose)
+        self.assertIsNotNone(tight)
+        self.assertLessEqual(
+            tight.compression_report["compressed_node_count"],
+            loose.compression_report["compressed_node_count"],
+        )
+
+    def test_importance_scores_reach_usable_tiers(self):
+        """
+        With recurrence permanently empty, every concept scored below the
+        PRUNABLE threshold, everything was pruned, and compression silently
+        fell back to emitting the entire uncompressed concept list.
+        """
+        from modules.knowledge_graph import build_knowledge_graph, get_tier
+        graph = build_knowledge_graph(_make_extraction())
+        tiers = {get_tier(v) for v in graph.importance_scores.values()}
+        self.assertTrue(
+            tiers - {"REDUNDANT"},
+            f"every concept landed in REDUNDANT: {graph.importance_scores}",
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class TestErrorHandler(unittest.TestCase):
 
     def test_retry_succeeds_on_first_try(self):

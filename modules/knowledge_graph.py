@@ -144,13 +144,18 @@ def _compute_importance_scores(
         ConceptType.ARGUMENT:   0.6, ConceptType.INSIGHT:    0.6,
         ConceptType.EXAMPLE:    0.3,
     }
+    # Single pass over the edge list; scanning it once per concept made this
+    # O(concepts x edges) and dominated runtime on book-length input.
+    support_types = {RelationType.SUPPORTS, RelationType.DERIVED_FROM}
+    support_counts: Dict[str, int] = {}
+    for e in edges:
+        if e.relation_type in support_types:
+            support_counts[e.target_id] = support_counts.get(e.target_id, 0) + 1
+
     max_recurrence = max((len(c.recurrence) for c in concepts), default=1) or 1
     max_inbound    = max((concept_graph.in_degree(c.id) for c in concepts), default=1) or 1
     max_dep_out    = max((dependency_graph.out_degree(c.id) for c in concepts), default=1) or 1
-    max_support_in = max(
-        (sum(1 for e in edges if e.target_id == c.id and e.relation_type in
-             {RelationType.SUPPORTS, RelationType.DERIVED_FROM})
-         for c in concepts), default=1) or 1
+    max_support_in = max(support_counts.values(), default=1) or 1
 
     scores = {}
     for c in concepts:
@@ -159,9 +164,7 @@ def _compute_importance_scores(
         dep_out = dependency_graph.out_degree(c.id)
         s2 = min((in_deg + dep_out * 1.5) / max(max_inbound + max_dep_out * 1.5, 1), 1.0)
         s3 = len(c.recurrence) / max_recurrence
-        support_in = sum(1 for e in edges if e.target_id == c.id and
-                         e.relation_type in {RelationType.SUPPORTS, RelationType.DERIVED_FROM})
-        s4 = support_in / max_support_in
+        s4 = support_counts.get(c.id, 0) / max_support_in
         s5 = type_weights.get(c.concept_type, 0.5)
         score = 0.30 * s1 + 0.25 * s2 + 0.20 * s3 + 0.15 * s4 + 0.10 * s5
         scores[c.id] = round(min(score, 1.0), 4)
@@ -175,20 +178,23 @@ def _run_insight_engine(
     importance_scores: Dict[str, float],
     edges: List[RelationshipEdge],
 ) -> Dict[str, str]:
+    outbound_support_counts: Dict[str, int] = {}
+    has_inbound: Set[str] = set()
+    for e in edges:
+        has_inbound.add(e.target_id)
+        if e.relation_type == RelationType.SUPPORTS:
+            outbound_support_counts[e.source_id] = outbound_support_counts.get(e.source_id, 0) + 1
+
     tags: Dict[str, str] = {}
     for c in concepts:
         score = importance_scores.get(c.id, 0.0)
-        inbound_support = sum(
-            1 for e in edges if e.target_id == c.id and
-            e.relation_type in {RelationType.SUPPORTS, RelationType.DERIVED_FROM}
-        )
-        outbound_support = sum(1 for e in edges if e.source_id == c.id and e.relation_type == RelationType.SUPPORTS)
+        outbound_support = outbound_support_counts.get(c.id, 0)
 
         if score >= 0.75:
             tags[c.id] = INSIGHT_CORE
         elif c.concept_type == ConceptType.CONCLUSION and outbound_support >= 1:
             tags[c.id] = INSIGHT_KEY
-        elif not any(e.target_id == c.id for e in edges) and outbound_support >= 1 and score < 0.5:
+        elif c.id not in has_inbound and outbound_support >= 1 and score < 0.5:
             tags[c.id] = INSIGHT_SUPPORTING
         else:
             tags[c.id] = INSIGHT_SUPPORTING  # default

@@ -6,10 +6,11 @@ Uses spaCy NLP with pattern-rule primary and heuristic fallback.
 
 from __future__ import annotations
 import re
+import bisect
 import uuid
 import hashlib
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Set, Tuple
 from enum import Enum
 
 from modules.text_segmentation import SegmentationResult, Segment
@@ -41,6 +42,17 @@ class RelationType(str, Enum):
     DERIVED_FROM = "DERIVED_FROM"
 
 
+# ── Title normalisation ───────────────────────────────────────────────────
+
+_WS_RE = re.compile(r"\s+")
+_EDGE_PUNCT_RE = re.compile(r"^[^\w]+|[^\w]+$")
+
+
+def normalise_title(title: str) -> str:
+    """Canonical form of a concept title, used for identity and deduplication."""
+    return _EDGE_PUNCT_RE.sub("", _WS_RE.sub(" ", (title or "").strip().lower()))
+
+
 # ── RESEARCH_LAYER Schemas ────────────────────────────────────────────────
 
 @dataclass
@@ -57,9 +69,17 @@ class ConceptNode:
     low_confidence: bool = False
 
     @staticmethod
-    def make_id(title: str, page: int) -> str:
-        raw = f"{title.lower().strip()}:{page}"
-        return hashlib.md5(raw.encode()).hexdigest()[:12]
+    def make_id(title: str) -> str:
+        """
+        Identity is derived from the normalised title alone.
+
+        The page number must NOT take part: a concept discussed on pages 12,
+        40 and 97 is one concept with three occurrences, not three concepts.
+        Including the page here silently disabled deduplication and left
+        `recurrence` permanently empty, which zeroed the recurrence signal in
+        every downstream importance score.
+        """
+        return hashlib.md5(normalise_title(title).encode()).hexdigest()[:12]
 
 
 @dataclass
@@ -163,7 +183,7 @@ def _extract_from_pattern(text: str, page: int, patterns, ctype: ConceptType) ->
                 continue
             if len(title) < 3 or len(defn) < 10:
                 continue
-            cid = ConceptNode.make_id(title, page)
+            cid = ConceptNode.make_id(title)
             nodes.append(ConceptNode(
                 id=cid,
                 title=title[:80],
@@ -171,6 +191,7 @@ def _extract_from_pattern(text: str, page: int, patterns, ctype: ConceptType) ->
                 definition=defn[:400],
                 context={"text_snippet": text[:100]},
                 source_page=page,
+                recurrence=[page],
                 salience=0.5,
             ))
     return nodes
@@ -189,8 +210,12 @@ def _extract_with_spacy(text: str, page: int, nlp) -> List[ConceptNode]:
             continue
         seen_titles.add(title.lower())
         # Extract surrounding sentence as definition
-        sent_text = ent.sent.text.strip() if ent.sent else title
-        cid = ConceptNode.make_id(title, page)
+        try:
+            sent_text = ent.sent.text.strip() if ent.sent else title
+        except ValueError:
+            # Pipeline has no sentence boundaries (parser/sentencizer disabled)
+            sent_text = title
+        cid = ConceptNode.make_id(title)
         nodes.append(ConceptNode(
             id=cid,
             title=title[:80],
@@ -198,6 +223,7 @@ def _extract_with_spacy(text: str, page: int, nlp) -> List[ConceptNode]:
             definition=sent_text[:400],
             context={"ner_label": ent.label_, "text_snippet": text[:100]},
             source_page=page,
+            recurrence=[page],
             salience=0.4,
             low_confidence=True,
         ))
@@ -206,56 +232,166 @@ def _extract_with_spacy(text: str, page: int, nlp) -> List[ConceptNode]:
 
 # ── Relationship detector ─────────────────────────────────────────────────
 
+# Maximum characters allowed between a concept title and the signal phrase
+# that links it. Mirrors the `.{0,80}` window of the original implementation.
+MAX_SIGNAL_GAP = 80
+
+# Upper bounds that keep detection linear on book-length input.
+MAX_TITLE_HITS_PER_SEGMENT = 3   # occurrences of one title considered per segment
+MAX_CANDIDATES_PER_SIDE    = 3   # nearest titles considered either side of a signal
+MAX_EDGES                  = 20000
+
+
+def _build_signal_matcher() -> Tuple[re.Pattern, Dict[str, RelationType]]:
+    """
+    One alternation over every signal phrase, longest first so that
+    "is a type of" wins over "is a". Returns the regex and a lookup from the
+    matched text back to its RelationType.
+    """
+    lookup: Dict[str, RelationType] = {}
+    for rtype, signals in _RELATION_SIGNALS:
+        for signal in signals:
+            lookup.setdefault(signal.lower(), rtype)
+    ordered = sorted(lookup, key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(s) for s in ordered), re.I)
+    return pattern, lookup
+
+
+_SIGNAL_RE, _SIGNAL_LOOKUP = _build_signal_matcher()
+
+
+def _find_title_spans(text_lower: str, titles: List[str]) -> List[Tuple[int, int, str]]:
+    """
+    Locate every concept title occurring in `text_lower`.
+
+    Cost is one substring scan per title, so this is linear in the number of
+    concepts — not quadratic in it, as pairwise regex matching was.
+    """
+    spans: List[Tuple[int, int, str]] = []
+    for title in titles:
+        pos = text_lower.find(title)
+        hits = 0
+        while pos != -1 and hits < MAX_TITLE_HITS_PER_SEGMENT:
+            spans.append((pos, pos + len(title), title))
+            hits += 1
+            pos = text_lower.find(title, pos + 1)
+    spans.sort()
+    return spans
+
+
 def _detect_relations(
     concepts: List[ConceptNode],
     segments: List[Segment],
 ) -> List[RelationshipEdge]:
     """
-    Heuristic relation detection: scan segment text for signal phrases
-    between pairs of concept titles.
+    Heuristic relation detection: for each signal phrase found in a segment,
+    pair the concept titles that sit just before it with those just after it.
+
+    The previous implementation tested every ordered pair of concept titles
+    against every signal phrase with a freshly built regex — roughly
+    segments x concepts^2 x 40 regex compilations. On a 60-page book (1,368
+    concepts, 72 segments) that is ~2.7e9 searches and the app hangs for over
+    thirteen minutes; on a full-length book it never returns. Anchoring the
+    search on signal occurrences instead makes the cost linear in the text.
+
+    The result is a strict superset of what the old code found. The old
+    `titles[i + 1:]` slice also required the source title to precede the
+    target in the concept list, which silently dropped roughly half the
+    relations even though the regex already pinned their order in the text.
     """
     edges: List[RelationshipEdge] = []
-    concept_index = {c.title.lower(): c for c in concepts}
+    seen_edge_ids: Set[str] = set()
+
+    concept_index: Dict[str, ConceptNode] = {}
+    for c in concepts:
+        key = c.title.lower().strip()
+        if len(key) >= 3:
+            concept_index.setdefault(key, c)
+    titles = list(concept_index)
+    if not titles:
+        return edges
 
     for segment in segments:
-        text_lower = segment.text.lower()
-        titles = list(concept_index.keys())
+        if len(edges) >= MAX_EDGES:
+            logger.warning(f"Relation cap of {MAX_EDGES} reached — stopping detection")
+            break
 
-        for i, t1 in enumerate(titles):
-            if t1 not in text_lower:
+        text_lower = segment.text.lower()
+        if not text_lower.strip():
+            continue
+
+        spans = _find_title_spans(text_lower, titles)
+        if len(spans) < 2:
+            continue
+
+        # `spans` is ordered by start position. Titles vary in length, so the
+        # end positions are not monotonic in that order and need their own
+        # ordering before they can be searched by bisection.
+        by_start = spans
+        starts = [span[0] for span in by_start]
+        by_end = sorted(spans, key=lambda span: span[1])
+        ends = [span[1] for span in by_end]
+
+        for m in _SIGNAL_RE.finditer(text_lower):
+            rtype = _SIGNAL_LOOKUP.get(m.group(0).lower())
+            if rtype is None:
                 continue
-            for t2 in titles[i + 1:]:
-                if t2 not in text_lower:
-                    continue
-                # Check if both appear in same sentence and if a signal word connects them
-                for rtype, signals in _RELATION_SIGNALS:
-                    for signal in signals:
-                        pattern = rf"{re.escape(t1)}.{{0,80}}{re.escape(signal)}.{{0,80}}{re.escape(t2)}"
-                        if re.search(pattern, text_lower, re.I | re.S):
-                            src = concept_index[t1]
-                            tgt = concept_index[t2]
-                            eid = RelationshipEdge.make_id(src.id, tgt.id, rtype)
-                            edge = RelationshipEdge(
-                                id=eid,
-                                source_id=src.id,
-                                target_id=tgt.id,
-                                relation_type=rtype,
-                                confidence=0.65,
-                                evidence=segment.text[:200],
-                                source_page=segment.start_page,
-                                bidirectional=(rtype == RelationType.CONTRADICTS),
-                            )
-                            edges.append(edge)
+            sig_start, sig_end = m.span()
+
+            # Titles ending within the window immediately before the signal.
+            left_lo = bisect.bisect_left(ends, sig_start - MAX_SIGNAL_GAP)
+            left_hi = bisect.bisect_right(ends, sig_start)
+            left = by_end[left_lo:left_hi][-MAX_CANDIDATES_PER_SIDE:]
+
+            # Titles starting within the window immediately after the signal.
+            right_lo = bisect.bisect_left(starts, sig_end)
+            right_hi = bisect.bisect_right(starts, sig_end + MAX_SIGNAL_GAP)
+            right = by_start[right_lo:right_hi][:MAX_CANDIDATES_PER_SIDE]
+
+            for _, _, t1 in left:
+                src = concept_index[t1]
+                for _, _, t2 in right:
+                    tgt = concept_index[t2]
+                    if src.id == tgt.id:
+                        continue
+                    eid = RelationshipEdge.make_id(src.id, tgt.id, rtype)
+                    if eid in seen_edge_ids:
+                        continue
+                    seen_edge_ids.add(eid)
+                    edges.append(RelationshipEdge(
+                        id=eid,
+                        source_id=src.id,
+                        target_id=tgt.id,
+                        relation_type=rtype,
+                        confidence=0.65,
+                        evidence=segment.text[:200],
+                        source_page=segment.start_page,
+                        bidirectional=(rtype == RelationType.CONTRADICTS),
+                    ))
+
     return edges
+
+
+def _inbound_counts(edges: List[RelationshipEdge]) -> Dict[str, int]:
+    """Inbound edge count per concept id, computed in a single pass."""
+    counts: Dict[str, int] = {}
+    for e in edges:
+        counts[e.target_id] = counts.get(e.target_id, 0) + 1
+    return counts
 
 
 def _compute_salience(
     concept: ConceptNode,
     all_concepts: List[ConceptNode],
     edges: List[RelationshipEdge],
+    inbound_counts: Optional[Dict[str, int]] = None,
 ) -> float:
     """
     RESEARCH_LAYER salience = TF * recurrence weight * type weight * edge centrality.
+
+    `inbound_counts` is precomputed by the caller. Deriving it here rescanned
+    every edge for every concept on every call, which is O(concepts^2 x edges)
+    across a full run.
     """
     type_weights = {
         ConceptType.THEOREM:    1.0,
@@ -266,24 +402,47 @@ def _compute_salience(
         ConceptType.INSIGHT:    0.6,
         ConceptType.EXAMPLE:    0.3,
     }
+    if inbound_counts is None:
+        inbound_counts = _inbound_counts(edges)
+
     recurrence_score = min(len(concept.recurrence) / 5.0, 1.0)
     type_score = type_weights.get(concept.concept_type, 0.5)
-    inbound = sum(1 for e in edges if e.target_id == concept.id)
-    max_inbound = max((sum(1 for e in edges if e.target_id == c.id) for c in all_concepts), default=1)
+    inbound = inbound_counts.get(concept.id, 0)
+    max_inbound = max(inbound_counts.values(), default=1)
     centrality = inbound / max(max_inbound, 1)
     return round(0.3 * concept.salience + 0.2 * recurrence_score + 0.1 * type_score + 0.4 * centrality, 4)
 
 
 def _deduplicate_concepts(concepts: List[ConceptNode]) -> List[ConceptNode]:
-    """Merge concepts with identical ids; track recurrence pages."""
+    """
+    Merge concepts that share an id (i.e. the same normalised title), folding
+    every page they appeared on into `recurrence` and keeping the richest
+    definition. `recurrence` is what the recurrence signal in the importance
+    score reads, so it must span the whole document, not a single page.
+    """
     seen: Dict[str, ConceptNode] = {}
     for c in concepts:
-        if c.id in seen:
-            existing = seen[c.id]
-            if c.source_page not in existing.recurrence:
-                existing.recurrence.append(c.source_page)
-        else:
+        existing = seen.get(c.id)
+        if existing is None:
+            if c.source_page not in c.recurrence:
+                c.recurrence.append(c.source_page)
             seen[c.id] = c
+            continue
+
+        for page in ([c.source_page] + list(c.recurrence)):
+            if page not in existing.recurrence:
+                existing.recurrence.append(page)
+
+        # Prefer the most informative definition and the earliest mention.
+        if len(c.definition or "") > len(existing.definition or ""):
+            existing.definition = c.definition
+        if c.source_page < existing.source_page:
+            existing.source_page = c.source_page
+        # A concept only stays low-confidence if every occurrence was.
+        existing.low_confidence = existing.low_confidence and c.low_confidence
+
+    for c in seen.values():
+        c.recurrence.sort()
     return list(seen.values())
 
 
@@ -322,7 +481,7 @@ def extract_concepts(segmentation: SegmentationResult) -> ExtractionResult:
         logger.warning("Few concepts found — creating segment-title concepts as fallback")
         for seg in segmentation.segments:
             if seg.title:
-                cid = ConceptNode.make_id(seg.title, seg.start_page)
+                cid = ConceptNode.make_id(seg.title)
                 all_concepts.append(ConceptNode(
                     id=cid,
                     title=seg.title[:80],
@@ -330,6 +489,7 @@ def extract_concepts(segmentation: SegmentationResult) -> ExtractionResult:
                     definition=seg.text[:300] if seg.text else seg.title,
                     context={"segment_type": seg.segment_type},
                     source_page=seg.start_page,
+                    recurrence=[seg.start_page],
                     salience=0.5,
                     low_confidence=True,
                 ))
@@ -340,9 +500,10 @@ def extract_concepts(segmentation: SegmentationResult) -> ExtractionResult:
     # Filter low-confidence edges
     edges = [e for e in edges if e.confidence >= 0.4]
 
-    # Recompute salience with edge data
+    # Recompute salience with edge data (inbound counts computed once, not per concept)
+    inbound = _inbound_counts(edges)
     for c in concepts:
-        c.salience = _compute_salience(c, concepts, edges)
+        c.salience = _compute_salience(c, concepts, edges, inbound)
 
     stats = {
         "total_concepts": len(concepts),

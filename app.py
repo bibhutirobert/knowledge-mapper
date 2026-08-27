@@ -16,7 +16,9 @@ from modules.pdf_ingestion import ingest_pdf, IngestedDocument
 from modules.text_segmentation import segment_document, SegmentationResult
 from modules.concept_extraction import extract_concepts, ExtractionResult
 from modules.knowledge_graph import build_knowledge_graph, KnowledgeGraph
-from modules.compression_engine import compress_graph, CompressionResult
+from modules.compression_engine import (
+    compress_graph, CompressionResult, max_nodes_for_level,
+)
 from modules.mindmap_generator import (
     generate_pyvis_html, generate_markdown_outline,
     generate_json, get_networkx_layout,
@@ -24,6 +26,7 @@ from modules.mindmap_generator import (
 from export.pdf_exporter import export_to_pdf
 from export.html_exporter import export_to_html
 from export.json_exporter import export_to_json
+from utils.error_handler import GraphError
 from utils.logger import get_logger
 
 logger = get_logger("app")
@@ -55,7 +58,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state initialisation ───────────────────────────────────────────
-for key in ["doc", "segments", "extraction", "graph", "compression", "stage_log"]:
+for key in ["doc", "segments", "extraction", "graph", "compression",
+            "stage_log", "processed_file"]:
     if key not in st.session_state:
         st.session_state[key] = None
 if "stage_log" not in st.session_state or st.session_state.stage_log is None:
@@ -69,14 +73,18 @@ def log_stage(name: str, status: str, detail: str = ""):
 
 
 def reset_state():
-    for key in ["doc", "segments", "extraction", "graph", "compression", "stage_log"]:
+    for key in ["doc", "segments", "extraction", "graph", "compression",
+                "stage_log", "processed_file"]:
         st.session_state[key] = None
+    for key in ["mm_html", "mm_json", "mm_md"]:
+        st.session_state.pop(key, None)
     st.session_state.stage_log = []
 
 
 # ── Pipeline orchestrator ──────────────────────────────────────────────────
 
-def run_pipeline(file_bytes: bytes, filename: str, progress_bar, status_text) -> bool:
+def run_pipeline(file_bytes: bytes, filename: str, progress_bar, status_text,
+                 compression_level: int = 3) -> bool:
     """
     Run all 8 stages with self-healing retries and fallbacks.
     Returns True on success, False on unrecoverable failure.
@@ -162,7 +170,9 @@ def run_pipeline(file_bytes: bytes, filename: str, progress_bar, status_text) ->
     # Compression Engine
     advance("Compressing graph")
     try:
-        compression: CompressionResult = compress_graph(graph)
+        compression: CompressionResult = compress_graph(
+            graph, max_nodes=max_nodes_for_level(compression_level)
+        )
         if compression is None:
             raise ValueError("Compression returned None")
         st.session_state.compression = compression
@@ -246,27 +256,42 @@ st.divider()
 
 # ── Upload + Run ────────────────────────────────────────────────────────────
 
-if uploaded is not None and st.session_state.compression is None:
+if uploaded is not None:
+    # A newly chosen file invalidates the results currently on screen.
+    file_key = (uploaded.name, uploaded.size)
+    if st.session_state.get("processed_file") not in (None, file_key):
+        reset_state()
+
+    already_done = (
+        st.session_state.compression is not None
+        and st.session_state.get("processed_file") == file_key
+    )
+
     col_info, col_btn = st.columns([3, 1])
     with col_info:
         st.markdown(f"**{uploaded.name}** · {uploaded.size:,} bytes")
     with col_btn:
-        run_btn = st.button("Process book ↗", type="primary", use_container_width=True)
+        label = "Reprocess ↻" if already_done else "Process book ↗"
+        run_btn = st.button(label, type="primary", use_container_width=True)
 
     if run_btn:
         reset_state()
-        file_bytes = uploaded.read()
+        # getvalue(), not read(): Streamlit reuses the same UploadedFile object
+        # across reruns, so a second read() returns zero bytes and ingestion
+        # fails on every run after the first.
+        file_bytes = uploaded.getvalue()
         prog = st.progress(0)
         status = st.empty()
         t0 = time.time()
-        success = run_pipeline(file_bytes, uploaded.name, prog, status)
+        success = run_pipeline(file_bytes, uploaded.name, prog, status, compression_hint)
         elapsed = time.time() - t0
         if success:
+            st.session_state.processed_file = file_key
             st.success(f"Processed in {elapsed:.1f}s — scroll down to explore the map.")
         else:
             st.error("Pipeline failed. Check the log in the sidebar for details.")
 
-elif uploaded is None and st.session_state.compression is None:
+elif st.session_state.compression is None:
     st.info("Upload a PDF in the sidebar to begin.")
 
 

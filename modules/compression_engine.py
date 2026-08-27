@@ -7,7 +7,7 @@ and simplified mind map generation as per the COMPRESSION_ENGINE specification.
 from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
@@ -31,6 +31,15 @@ MAX_NODES            = 80
 MAX_DEPTH            = 4
 MIN_CLUSTER_SIZE     = 2
 MAX_CLUSTER_SIZE     = 12
+
+
+# Node budget per UI compression level (1 = keep most, 5 = keep least).
+_LEVEL_NODE_BUDGET = {1: 160, 2: 120, 3: 80, 4: 50, 5: 30}
+
+
+def max_nodes_for_level(level: int) -> int:
+    """Translate the sidebar's 1-5 compression level into a node budget."""
+    return _LEVEL_NODE_BUDGET.get(level, MAX_NODES)
 
 
 @dataclass
@@ -127,32 +136,35 @@ def _cluster_concepts(
         assigned[root_id] = cl.cluster_id
 
     # Phase B: assign remaining survivors to nearest cluster (by shared edges)
+    neighbours: Dict[str, Set[str]] = {}
+    for e in graph.edges:
+        neighbours.setdefault(e.source_id, set()).add(e.target_id)
+        neighbours.setdefault(e.target_id, set()).add(e.source_id)
+
     for node_id in survivors:
         if node_id in assigned:
             continue
+        node_neighbours = neighbours.get(node_id, set())
         best_cluster = None
         best_score = -1
         for cl in clusters:
-            shared = sum(
-                1 for e in graph.edges
-                if (e.source_id == node_id and e.target_id in cl.member_ids) or
-                   (e.target_id == node_id and e.source_id in cl.member_ids)
-            )
+            shared = len(node_neighbours.intersection(cl.member_ids))
             if shared > best_score:
                 best_score = shared
                 best_cluster = cl
         if best_cluster is None:
-            # create singleton cluster
+            # No cluster to join yet — start one. Falls back to the concept id
+            # when the concept is missing, so this can never leave the cluster
+            # unset (which previously raised AttributeError on the next line).
             c = concepts.get(node_id)
-            if c:
-                best_cluster = Cluster(
-                    cluster_id=str(uuid.uuid4())[:8],
-                    domain=c.concept_type.value,
-                    seed_concept_id=node_id,
-                    member_ids=[],
-                    label=c.title,
-                )
-                clusters.append(best_cluster)
+            best_cluster = Cluster(
+                cluster_id=str(uuid.uuid4())[:8],
+                domain=c.concept_type.value if c else "UNKNOWN",
+                seed_concept_id=node_id,
+                member_ids=[],
+                label=c.title if c else node_id,
+            )
+            clusters.append(best_cluster)
         best_cluster.member_ids.append(node_id)
         assigned[node_id] = best_cluster.cluster_id
 
@@ -234,7 +246,10 @@ def _cluster_concepts(
 
 # ── Condensation (4 operations) ───────────────────────────────────────────
 
-def _run_condensation(graph: KnowledgeGraph) -> Tuple[List[str], Dict, List[str], Dict]:
+def _run_condensation(
+    graph: KnowledgeGraph,
+    max_nodes: int = MAX_NODES,
+) -> Tuple[List[str], Dict, List[str], Dict]:
     """
     Returns (survivor_ids, annotations_by_parent, chain_orphan_ids, report)
     """
@@ -307,20 +322,27 @@ def _run_condensation(graph: KnowledgeGraph) -> Tuple[List[str], Dict, List[str]
 
     # Op 4: prerequisite chain flattening
     # (represented conceptually; long chains tracked for bridge node generation)
-    dep_edges = [e for e in graph.edges if e.relation_type == RelationType.DEPENDS_ON]
+    deduped_set = set(deduped)
+    dep_successors: Dict[str, List[str]] = {}
+    for e in graph.edges:
+        if e.relation_type == RelationType.DEPENDS_ON and e.target_id in deduped_set:
+            dep_successors.setdefault(e.source_id, []).append(e.target_id)
+
     # Build dependency chains
     flat_report = {"flattened_chains": 0}
     for start in deduped:
         chain = [start]
+        seen_in_chain = {start}
         current = start
         while True:
-            succs = [e.target_id for e in dep_edges if e.source_id == current and e.target_id in deduped]
+            succs = dep_successors.get(current)
             if not succs:
                 break
             next_node = succs[0]
-            if next_node in chain:
+            if next_node in seen_in_chain:
                 break
             chain.append(next_node)
+            seen_in_chain.add(next_node)
             current = next_node
         if len(chain) > 3:
             flat_report["flattened_chains"] += 1
@@ -328,8 +350,8 @@ def _run_condensation(graph: KnowledgeGraph) -> Tuple[List[str], Dict, List[str]
     report["flattened"] = flat_report["flattened_chains"]
 
     # Compression ratio safety
-    if len(deduped) > MAX_NODES:
-        deduped = sorted(deduped, key=lambda n: scores.get(n, 0), reverse=True)[:MAX_NODES]
+    if len(deduped) > max_nodes:
+        deduped = sorted(deduped, key=lambda n: scores.get(n, 0), reverse=True)[:max_nodes]
     if len(deduped) < MIN_NODES and len(remaining) >= MIN_NODES:
         deduped = sorted(remaining, key=lambda n: scores.get(n, 0), reverse=True)[:MIN_NODES]
 
@@ -438,7 +460,10 @@ def _build_mind_map_tree(
 # ── Public API ────────────────────────────────────────────────────────────
 
 @safe_stage("compression_engine", fallback_result=None)
-def compress_graph(graph: KnowledgeGraph) -> Optional[CompressionResult]:
+def compress_graph(
+    graph: KnowledgeGraph,
+    max_nodes: int = MAX_NODES,
+) -> Optional[CompressionResult]:
     """
     Main compression entry point. Implements full COMPRESSION_ENGINE spec.
     Fallback: if compression yields < MIN_NODES, returns a flat map of all concepts.
@@ -449,14 +474,16 @@ def compress_graph(graph: KnowledgeGraph) -> Optional[CompressionResult]:
     )
 
     # Run condensation
-    survivor_ids, annotations, chain_orphans, cond_report = _run_condensation(graph)
+    survivor_ids, annotations, chain_orphans, cond_report = _run_condensation(graph, max_nodes)
 
     if len(survivor_ids) < MIN_NODES:
         logger.warning(
             f"Compression yielded {len(survivor_ids)} nodes — below minimum. "
             "Using all concepts as fallback."
         )
-        survivor_ids = list(graph.concepts.keys())[:MAX_NODES]
+        survivor_ids = sorted(
+            graph.concepts, key=lambda n: graph.importance_scores.get(n, 0), reverse=True
+        )[:max_nodes]
 
     # Cluster survivors
     clusters, bridges = _cluster_concepts(graph, survivor_ids)
